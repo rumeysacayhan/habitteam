@@ -54,6 +54,7 @@ React Native / Expo ile geliştirilen bir alışkanlık & rutin takip uygulamas�
 |:---:|:---:|
 | <img src="assets/screenshots/habitteam-welcome.png" width="250"><br>**Welcome** | <img src="assets/screenshots/habitteam-onboarding.png" width="250"><br>**Onboarding** |
 | <img src="assets/screenshots/habitteam-home.png" width="250"><br>**Ana Sayfa** | <img src="assets/screenshots/habitteam-calendar.png" width="250"><br>**Takvim** |
+| <img src="assets/screenshots/habitteam-team.png" width="250"><br>**Ekip**<br>Arkadaşlarınla ortak rutinler oluştur, birbirinizi takip edip motive olun | <img src="assets/screenshots/habitteam-create-routine.png" width="250"><br>**Yeni Rutin Oluştur**<br>Tekli veya ortak rutin oluştur; günleri, saati ve hatırlatmaları özelleştir |
 
 ---
 
