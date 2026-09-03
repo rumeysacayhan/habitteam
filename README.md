@@ -144,4 +144,4 @@ habitteam/
 
 ## Not
 
-Bu, kişisel bir portföy projesidir ve private repo olarak tutulmaktadır. Herkese açık bir dağıtımı yoktur.
+Bu, kişisel bir portföy projesidir.
