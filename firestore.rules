@@ -1,0 +1,248 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Yardımcı fonksiyonlar ──────────────────────────────────────
+    // Friendship doküman ID'si [uidA, uidB].sort().join('_') — her iki sıra kontrol edilir.
+    function isFriendOf(uid1, uid2) {
+      return exists(/databases/$(database)/documents/friendships/$(uid1 + '_' + uid2)) ||
+             exists(/databases/$(database)/documents/friendships/$(uid2 + '_' + uid1));
+    }
+
+    // newList'te olup oldList'te olmayan elemanların tam olarak 1 adet olduğunu
+    // ve o tek yeni elemanın requesterUid'in arkadaşı olduğunu doğrular.
+    // index/sıra varsayımı yok: removeAll() set farkı alır.
+    function onlyAddedFriend(oldList, newList, requesterUid) {
+      let added = newList.removeAll(oldList);
+      return added.size() == 1 && isFriendOf(requesterUid, added[0]);
+    }
+
+    // coopRoutines belgesinden owner uid'ini döndürür.
+    // ownerId alanı yoksa (eski dokümanlar) creatorId'ye düşer — getRoutineOwnerId() ile simetrik.
+    function coopRoutineOwner(routineId) {
+      let r = get(/databases/$(database)/documents/coopRoutines/$(routineId)).data;
+      return r.get('ownerId', r.creatorId);
+    }
+
+    // ── Kullanıcı profili ──────────────────────────────────────────
+    match /users/{userId} {
+      // Sahibi her zaman okuyabilir; arkadaşlar da okuyabilir (yazamaz)
+      allow read: if request.auth != null &&
+        (request.auth.uid == userId ||
+         exists(/databases/$(database)/documents/friendships/$(request.auth.uid + '_' + userId)) ||
+         exists(/databases/$(database)/documents/friendships/$(userId + '_' + request.auth.uid)));
+      allow write: if request.auth != null && request.auth.uid == userId;
+
+      match /habits/{habitId} {
+        allow read, write: if request.auth != null
+                           && request.auth.uid == userId;
+      }
+      match /completions/{completionId} {
+        allow read, write: if request.auth != null
+                           && request.auth.uid == userId;
+      }
+    }
+
+    // ── Arkadaşlık davet kodları ───────────────────────────────────
+    match /friendInvites/{inviteCode} {
+      // Kodu yaratan kişi oluşturabilir
+      allow create: if request.auth != null &&
+        request.auth.uid == request.resource.data.ownerId;
+
+      // ID bilinerek tek doküman okunabilir
+      allow get: if request.auth != null;
+      // Sadece kendi ownerId'siyle filtrelenmiş sorgu (hesap silme akışı için)
+      // Filtre olmadan Firestore bu kuralı sağlayamaz → rastgele kod enumeration hâlâ engellenir
+      allow list: if request.auth != null &&
+        resource.data.ownerId == request.auth.uid;
+
+      // Sahibi her şeyi güncelleyebilir;
+      // sahibi olmayan biri SADECE used: false → true yapabilir, başka alan değiştiremez,
+      // ve davetin süresi dolmamış olmalı
+      allow update: if request.auth != null && (
+        request.auth.uid == resource.data.ownerId ||
+        (
+          resource.data.used == false &&
+          request.resource.data.used == true &&
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used']) &&
+          resource.data.expiresAt > request.time
+        )
+      );
+
+      // Sahibi hesabını silerken kendi davetlerini silebilir
+      allow delete: if request.auth != null &&
+        request.auth.uid == resource.data.ownerId;
+    }
+
+    // ── Arkadaşlık kayıtları ───────────────────────────────────────
+    // Doküman ID formatı: [uidA, uidB].sort().join('_') — deterministik,
+    // kim redeem ederse etsin aynı ID oluşur. Kurallar ID'yi parse etmez;
+    // ownerId doğrulaması friendInvites dokümanının data alanından yapılır.
+    match /friendships/{friendshipId} {
+      // Taraflardan biri tek doküman okuyabilir;
+      // resource == null: henüz var olmayan doküman sorgusu permission-denied yerine "bulunamadı" döner
+      allow get: if request.auth != null &&
+        (resource == null || request.auth.uid in resource.data.uids);
+      // Taraflardan biri kendi arkadaşlıklarını listeleyebilir (array-contains query için)
+      allow list: if request.auth != null &&
+        request.auth.uid in resource.data.uids;
+
+      // Taraflardan biri hesabını silerken ilişkili friendship'i silebilir
+      allow delete: if request.auth != null &&
+        request.auth.uid in resource.data.uids;
+
+      // Friendship ancak geçerli bir davet koduyla kurulabilir:
+      // - işlemi yapan kişi uids içinde olmalı; tam 2 uid bulunmalı
+      // - ownerId, friendInvites dokümanından okunur (ID pozisyonundan değil)
+      // - ownerId uids içinde olmalı; işlemi yapan kişi ownerId olmamalı
+      // - davet kodu kullanılmamış (used == false) ve süresi dolmamış olmalı
+      allow create: if request.auth != null &&
+        request.auth.uid in request.resource.data.uids &&
+        request.resource.data.uids.size() == 2 &&
+        get(/databases/$(database)/documents/friendInvites/$(request.resource.data.viaInviteCode)).data.ownerId
+          in request.resource.data.uids &&
+        get(/databases/$(database)/documents/friendInvites/$(request.resource.data.viaInviteCode)).data.ownerId
+          != request.auth.uid &&
+        get(/databases/$(database)/documents/friendInvites/$(request.resource.data.viaInviteCode)).data.used != true &&
+        get(/databases/$(database)/documents/friendInvites/$(request.resource.data.viaInviteCode)).data.expiresAt
+          > request.time;
+    }
+
+    // ── Ortak rutinler ─────────────────────────────────────────────
+    match /coopRoutines/{routineId} {
+      // Katılımcı veya davetli okuyabilir.
+      // Eski dokümanlar (pendingIds alanı yok) geriye uyumlu: sadece participantIds kontrol edilir.
+      allow read: if request.auth != null &&
+        (request.auth.uid in resource.data.participantIds ||
+         request.auth.uid in resource.data.get('pendingIds', []));
+
+      // ── Güncelleme kuralları ─────────────────────────────────────────
+
+      // U1. Davet cevabı — pendingIds üyesi yalnızca davet akış alanlarını değiştirebilir.
+      //     Kabul ederken kendi memberSince'ini yazabilir; yeniden katılıyorsa memberUntil'ini temizleyebilir.
+      //     Her iki haritada SADECE kendi uid'ine ait key değişebilir.
+      allow update: if request.auth != null &&
+        request.auth.uid in resource.data.get('pendingIds', []) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['participantIds', 'pendingIds', 'declinedIds', 'status', 'memberSince', 'memberUntil']) &&
+        resource.data.get('memberSince', {}).diff(request.resource.data.get('memberSince', {}))
+          .affectedKeys().hasOnly([request.auth.uid]) &&
+        resource.data.get('memberUntil', {}).diff(request.resource.data.get('memberUntil', {}))
+          .affectedKeys().hasOnly([request.auth.uid]);
+
+      // U2. İçerik düzenleme — ownerId sahibi (eski dokümanlar için creatorId fallback).
+      //     participantIds, pendingIds, declinedIds, ownerId, status'a dokunamaz.
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'icon', 'repeatType', 'repeatDays', 'reminderTime', 'onceDate']);
+
+      // U3. Sahip yeni üye davet eder — eski girişler çıkarılamaz; tam 1 uid eklenir
+      //     ve o uid sahibin arkadaşı olmalı. removeAll() ile index/sıra bağımsız.
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId) &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pendingIds']) &&
+        request.resource.data.pendingIds.hasAll(resource.data.get('pendingIds', [])) &&
+        onlyAddedFriend(resource.data.get('pendingIds', []),
+          request.resource.data.pendingIds, request.auth.uid);
+
+      // U4. Üye kendi isteğiyle ayrılır — sahip bu yolla ayrılamaz (önce devretmeli).
+      //     Yalnızca kendi uid'ini çıkarabilir; yeni liste eski listenin gerçek alt kümesi
+      //     olmalı (başkası eklenemez veya çıkarılamaz). Çıkış sonrası en az 1 katılımcı kalmalı.
+      //     memberUntil'de SADECE ayrılan kişinin kendi key'i yazılabilir (çıkış tarihi).
+      allow update: if request.auth != null &&
+        request.auth.uid in resource.data.participantIds &&
+        request.auth.uid != resource.data.get('ownerId', resource.data.creatorId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['participantIds', 'memberUntil']) &&
+        !(request.auth.uid in request.resource.data.participantIds) &&
+        resource.data.participantIds.hasAll(request.resource.data.participantIds) &&
+        request.resource.data.participantIds.size() == resource.data.participantIds.size() - 1 &&
+        resource.data.participantIds.size() >= 2 &&
+        resource.data.get('memberUntil', {}).diff(request.resource.data.get('memberUntil', {}))
+          .affectedKeys().hasOnly([request.auth.uid]);
+
+      // U5. Sahip bir üyeyi çıkarır — kendi uid'i listede kalmaya devam etmeli.
+      //     Yalnızca bir kişi çıkarılabilir; yeni liste eski listenin gerçek alt kümesi olmalı.
+      //     memberUntil'de sadece çıkarılan kişinin key'i yazılabilir (removeAll ile tespit edilir).
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['participantIds', 'memberUntil']) &&
+        request.auth.uid in request.resource.data.participantIds &&
+        resource.data.participantIds.hasAll(request.resource.data.participantIds) &&
+        request.resource.data.participantIds.size() == resource.data.participantIds.size() - 1 &&
+        resource.data.get('memberUntil', {}).diff(request.resource.data.get('memberUntil', {}))
+          .affectedKeys().hasOnly(
+            resource.data.participantIds.removeAll(request.resource.data.participantIds)
+          );
+
+      // U6. Sahiplik devri + ayrılma — tek atomik yazma.
+      //     Yeni ownerId eski participantIds'te bulunmalı ve eski sahipten farklı olmalı.
+      //     Eski sahip listeden çıkar; yeni liste eski listenin gerçek alt kümesi olmalı.
+      //     memberUntil'de SADECE devreden (eski) sahibin key'i yazılabilir (çıkış tarihi).
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId) &&
+        request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['ownerId', 'participantIds', 'memberUntil']) &&
+        request.resource.data.ownerId != request.auth.uid &&
+        request.resource.data.ownerId in resource.data.participantIds &&
+        !(request.auth.uid in request.resource.data.participantIds) &&
+        resource.data.participantIds.hasAll(request.resource.data.participantIds) &&
+        request.resource.data.participantIds.size() == resource.data.participantIds.size() - 1 &&
+        resource.data.get('memberUntil', {}).diff(request.resource.data.get('memberUntil', {}))
+          .affectedKeys().hasOnly([request.auth.uid]);
+
+      // U7. Tek kalan üye (sahip) rutini bireysel'e çevirir.
+      allow update: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId) &&
+        resource.data.participantIds.size() == 1 &&
+        resource.data.participantIds[0] == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+        request.resource.data.status == 'individual';
+
+      // Yalnızca ownerId sahibi silebilir (daraltıldı: önceden herhangi bir katılımcı/davetli silebiliyordu).
+      allow delete: if request.auth != null &&
+        request.auth.uid == resource.data.get('ownerId', resource.data.creatorId);
+
+      // Creator oluşturabilir; başlangıçta sadece kendi uid'i participantIds'te
+      // (davet sistemi: en az 1 kişi yeterli).
+      allow create: if request.auth != null &&
+        request.auth.uid == request.resource.data.creatorId &&
+        request.auth.uid in request.resource.data.participantIds &&
+        request.resource.data.participantIds.size() >= 1;
+    }
+
+    // ── Ortak rutin tamamlanma kayıtları ──────────────────────────
+    match /coopCompletions/{completionId} {
+      // Güncel rutin katılımcısı okuyabilir.
+      // Donmuş participantIds yerine bağlı coopRoutine'in güncel listesi kullanılır —
+      // sonradan katılan üyeler eski tamamlama kayıtlarına da erişebilir.
+      allow read: if request.auth != null &&
+        request.auth.uid in
+          get(/databases/$(database)/documents/coopRoutines/$(resource.data.routineId)).data.participantIds;
+
+      // Yalnızca completion'ın sahibi (completedBy == auth.uid) güncelleyebilir.
+      // Bir katılımcının başka birinin tamamlanma kaydını değiştirmesi engellenir.
+      allow update: if request.auth != null &&
+        resource.data.completedBy == request.auth.uid;
+
+      // Silme: kendi kaydını silen (toggle geri alma) VEYA rutinin sahibi (cascade silme).
+      // Rutin silinirken owner tüm completion kayıtlarını toplu siler; completedBy kontrolü
+      // bunu kesmemeli. coopRoutines belgesi completion'lardan ÖNCE silinmediği sürece get() çalışır.
+      allow delete: if request.auth != null && (
+        resource.data.completedBy == request.auth.uid ||
+        request.auth.uid == coopRoutineOwner(resource.data.routineId)
+      );
+
+      // Güncel katılımcılardan biri oluşturabilir — get() ile canlı participantIds kontrol edilir.
+      // completedBy == auth.uid: başkası adına completion oluşturulamaz.
+      // completion dokümanındaki participantIds alanı tarihsel kayıt olarak kalır, izin kontrolünde kullanılmaz.
+      allow create: if request.auth != null &&
+        request.auth.uid in
+          get(/databases/$(database)/documents/coopRoutines/$(request.resource.data.routineId)).data.participantIds &&
+        request.resource.data.completedBy == request.auth.uid;
+    }
+
+  }
+}

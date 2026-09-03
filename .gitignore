@@ -1,0 +1,10 @@
+node_modules/
+.expo/
+dist/
+*.log
+**/.DS_Store
+service-account-key.json
+.env
+.claude/settings.local.json
+/ios
+scripts/
